@@ -1,0 +1,795 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>CodeProbe — AI Code Intelligence by Daniel Mose</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800;900&family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet"/>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:#00050F;}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(1.5)}}
+@keyframes bounce{0%,80%,100%{transform:scale(0)}40%{transform:scale(1.1)}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+::-webkit-scrollbar{width:4px;}
+/* Force email addresses to always display */
+[data-cfemail]{display:none!important;}
+.email-address{display:inline!important;unicode-bidi:plaintext;}
+::-webkit-scrollbar-thumb{background:rgba(0,212,255,.4);border-radius:4px;}
+select option{background:#030C1A;color:#EFF6FF;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const{useState,useRef,useEffect}=React;
+
+const GEMINI_KEY="AIzaSyBNw1oVgnyRPFs1JdgQNVBNjn3a6sTZky4";
+const GEMINI_URL="https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key="+GEMINI_KEY;
+const EJS={serviceId:"service_7ckkfv5",templateId:"template_0jeqcd9",publicKey:"AtIjUOwnCskIaCG8r"};
+let GH_TOKEN=""; // set by user in the UI
+
+const T={
+  bg:"#00050F",s1:"#030C1A",s2:"#061322",ac:"#00D4FF",gr:"#00E5A0",
+  rd:"#FF4060",am:"#FFB020",bl:"#4D9FFF",t0:"#EFF6FF",t1:"#7A8A9E",t2:"#2E3D52",
+  mono:"'JetBrains Mono',monospace",sans:"'DM Sans',sans-serif",disp:"'Syne',sans-serif",
+};
+
+// ── REAL GitHub fetcher ──────────────────────────────
+async function fetchRepoFiles(owner, repo) {
+  const CODE_EXT=[".py",".js",".ts",".jsx",".tsx",".go",".java",".rb",".php",".rs",".cpp",".c",".cs"];
+  const PRIORITY=["auth","api","route","model","controller","service","util","middleware","security","config"];
+
+  const headers=GH_TOKEN?{Authorization:"token "+GH_TOKEN}:{};
+  const repoRes = await fetch("https://api.github.com/repos/"+owner+"/"+repo,{headers:headers});
+  if(repoRes.status===403||repoRes.status===429) throw new Error("GitHub rate limit hit. Please add a GitHub token in the field above to continue.");
+  if(repoRes.status===404) throw new Error("Repository '"+owner+"/"+repo+"' not found or is private. Check the name.");
+  if(!repoRes.ok) throw new Error("GitHub error "+repoRes.status+". Try adding a GitHub token.");
+  const repoData = await repoRes.json();
+  const branch = repoData.default_branch || "main";
+
+  const treeRes = await fetch("https://api.github.com/repos/"+owner+"/"+repo+"/git/trees/"+branch+"?recursive=1",{headers:headers});
+  if(!treeRes.ok) throw new Error("Could not read repository file tree.");
+  const tree = await treeRes.json();
+
+  if(!tree.tree) throw new Error("Repository appears to be empty.");
+
+  let files = tree.tree.filter(function(f){
+    return f.type==="blob" &&
+      CODE_EXT.some(function(e){return f.path.endsWith(e);}) &&
+      f.size > 100 && f.size < 40000 &&
+      !f.path.includes("node_modules") &&
+      !f.path.includes("vendor/") &&
+      !f.path.includes(".min.") &&
+      !f.path.includes("dist/") &&
+      !f.path.includes("build/") &&
+      !f.path.includes("__pycache__") &&
+      !f.path.includes(".test.") &&
+      !f.path.includes(".spec.");
+  });
+
+  const priority = files.filter(function(f){return PRIORITY.some(function(p){return f.path.toLowerCase().includes(p);});});
+  const rest = files.filter(function(f){return !PRIORITY.some(function(p){return f.path.toLowerCase().includes(p);});});
+  files = priority.concat(rest).slice(0,8);
+
+  if(files.length===0) throw new Error("No analyzable source files found. This repo may use an unsupported language.");
+
+  const contents = await Promise.all(files.map(async function(f){
+    try{
+      const res = await fetch("https://api.github.com/repos/"+owner+"/"+repo+"/contents/"+f.path,{headers:headers});
+      if(!res.ok) return null;
+      const data = await res.json();
+      if(!data.content) return null;
+      const decoded = atob(data.content.replace(/\n/g,""));
+      return {path:f.path, content:decoded.slice(0,2500)};
+    }catch(e){return null;}
+  }));
+
+  return contents.filter(Boolean);
+}
+
+// ── Gemini AI ────────────────────────────────────────
+async function gemini(prompt) {
+  const r = await fetch(GEMINI_URL,{
+    method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({contents:[{role:"user",parts:[{text:prompt}]}],generationConfig:{maxOutputTokens:1500,temperature:0.3}})
+  });
+  const d = await r.json();
+  const t = d&&d.candidates&&d.candidates[0]&&d.candidates[0].content&&d.candidates[0].content.parts&&d.candidates[0].content.parts[0]&&d.candidates[0].content.parts[0].text;
+  if(!t) throw new Error("No response from Gemini");
+  return t;
+}
+
+async function analyzeCode(files, repoName) {
+  const fileSnippets = files.map(function(f){
+    return "=== FILE: "+f.path+" ===\n"+f.content;
+  }).join("\n\n");
+
+  const prompt = "You are CodeProbe AI, an elite security engineer. Analyze these real source files from the GitHub repository '"+repoName+"' and find actual security vulnerabilities and performance issues.\n\nFILES:\n"+fileSnippets+"\n\nRespond with EXACTLY this format for each issue found (find 4-8 real issues):\n\nISSUE\nTitle: [specific issue title]\nSeverity: [critical|warning|info]\nCategory: [Security|Performance|Quality|Observability]\nFile: [exact filename from above]\nLine: [approximate line number]\nDescription: [2 sentences explaining the real problem found in this code]\nVulnerable:\n[the actual vulnerable code snippet, max 5 lines]\nFix:\n[the corrected code, max 5 lines]\nEND\n\nOnly report issues actually present in the code above. Be specific and accurate.";
+
+  return await gemini(prompt);
+}
+
+function parseIssues(text, files) {
+  const issues = [];
+  const blocks = text.split(/\nISSUE\n|\nISSUE:/i).filter(function(b){return b.trim().length>20;});
+
+  blocks.forEach(function(block, idx){
+    const get = function(key){
+      const m = block.match(new RegExp(key+":\\s*([^\\n]+)","i"));
+      return m ? m[1].trim() : "";
+    };
+
+    const title = get("Title");
+    if(!title) return;
+
+    const sevRaw = get("Severity").toLowerCase();
+    const sev = sevRaw.includes("crit")||sevRaw.includes("high") ? "critical"
+               : sevRaw.includes("warn")||sevRaw.includes("med") ? "warning" : "info";
+
+    const vulnMatch = block.match(/Vulnerable:\s*\n([\s\S]*?)(?:\nFix:|\nEND)/i);
+    const fixMatch  = block.match(/Fix:\s*\n([\s\S]*?)(?:\nEND|\nISSUE|$)/i);
+
+    issues.push({
+      id: idx+1,
+      sev: sev,
+      file: get("File") || (files[0] ? files[0].path : "unknown"),
+      line: parseInt(get("Line"))||1,
+      title: title.slice(0,80),
+      cat: get("Category")||"Security",
+      desc: get("Description")||"See analysis below.",
+      bad: vulnMatch ? vulnMatch[1].trim().slice(0,300) : "See file for details",
+      good: fixMatch  ? fixMatch[1].trim().slice(0,300)  : "Apply recommended fix",
+    });
+  });
+
+  return issues.slice(0,10);
+}
+
+// ── EmailJS + WhatsApp notify ────────────────────────
+async function notifyEmail(userData) {
+  try{
+    await fetch("https://api.emailjs.com/api/v1.0/email/send",{
+      method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        service_id:EJS.serviceId,template_id:EJS.templateId,user_id:EJS.publicKey,
+        template_params:{
+          to_name:"Daniel Mose",to_email:"danielmose776@gmail.com",
+          from_name:userData.name,from_email:userData.email,
+          subject:"New CodeProbe Sign-Up!",
+          message:"New user: "+userData.name+" | "+userData.email+" | "+new Date().toLocaleString("en-KE",{timeZone:"Africa/Nairobi"}),
+          reply_to:userData.email
+        }
+      })
+    });
+  }catch(e){console.log("Email notify failed:",e.message);}
+}
+function notifyWhatsApp(userData) {
+  const time = new Date().toLocaleString("en-KE",{timeZone:"Africa/Nairobi"});
+  const msg = "New CodeProbe Sign-Up!\n\nName: "+(userData.name||"Unknown")+"\nEmail: "+userData.email+"\nTime: "+time;
+  window.open("https://wa.me/254740851637?text="+encodeURIComponent(msg),"_blank");
+}
+
+// ── Atoms ────────────────────────────────────────────
+function Dot({color,size}){
+  color=color||T.gr; size=size||7;
+  return React.createElement("span",{style:{display:"inline-block",width:size,height:size,borderRadius:"50%",background:color,boxShadow:"0 0 "+(size*2)+"px "+color,animation:"pulse 2s infinite",flexShrink:0}});
+}
+function Badge({label,color,bg}){
+  return React.createElement("span",{style:{padding:"2px 8px",borderRadius:3,fontSize:9,fontWeight:700,fontFamily:T.mono,letterSpacing:".12em",textTransform:"uppercase",background:bg,color:color,border:"1px solid "+color+"30"}},label);
+}
+function CodePane({label,code,color}){
+  const[ok,setOk]=useState(false);
+  return React.createElement("div",{style:{border:"1px solid rgba(255,255,255,.07)",borderRadius:7,overflow:"hidden",marginBottom:12}},
+    React.createElement("div",{style:{padding:"7px 13px",display:"flex",justifyContent:"space-between",background:color+"08"}},
+      React.createElement("span",{style:{fontSize:9,fontFamily:T.mono,color:color,fontWeight:700,letterSpacing:".15em"}},label),
+      React.createElement("button",{onClick:function(){navigator.clipboard&&navigator.clipboard.writeText(code);setOk(true);setTimeout(function(){setOk(false);},2000);},style:{fontSize:10,fontFamily:T.mono,color:ok?T.gr:T.t2,background:"none",border:"none",cursor:"pointer"}},ok?"✓ copied":"copy")
+    ),
+    React.createElement("pre",{style:{margin:0,padding:"12px 14px",background:T.bg,fontSize:11,lineHeight:1.9,overflowX:"auto",color:color+"DD",fontFamily:T.mono}},code)
+  );
+}
+function AITyping({loading,text}){
+  const[out,setOut]=useState("");
+  useEffect(function(){
+    if(!text){setOut("");return;}
+    setOut("");var i=0;
+    var iv=setInterval(function(){if(i<text.length)setOut(text.slice(0,++i));else clearInterval(iv);},7);
+    return function(){clearInterval(iv);};
+  },[text]);
+  return React.createElement("div",{style:{background:T.s1,border:"1px solid rgba(0,212,255,.2)",borderRadius:7,overflow:"hidden",marginTop:4}},
+    React.createElement("div",{style:{padding:"8px 14px",borderBottom:"1px solid rgba(0,212,255,.12)",display:"flex",gap:8,alignItems:"center",background:"linear-gradient(90deg,rgba(0,212,255,.06),transparent)"}},
+      React.createElement(Dot,{size:5}),
+      React.createElement("span",{style:{fontSize:9,fontFamily:T.mono,color:T.ac,fontWeight:700,letterSpacing:".15em"}},"GEMINI AI ANALYSIS")
+    ),
+    React.createElement("div",{style:{padding:"15px 18px",fontSize:13,color:T.t0,lineHeight:1.85,fontFamily:T.sans,minHeight:60,whiteSpace:"pre-wrap"}},
+      loading ? React.createElement("div",{style:{display:"flex",gap:5}},
+        [0,1,2].map(function(i){return React.createElement("div",{key:i,style:{width:6,height:6,borderRadius:"50%",background:T.ac,animation:"bounce 1s "+(i*.15)+"s infinite"}});})
+      ) : text ? React.createElement(React.Fragment,null,out,React.createElement("span",{style:{opacity:.3}},"█"))
+        : React.createElement("span",{style:{color:T.t2,fontSize:11,fontFamily:T.mono}},"← Select an issue to see AI analysis")
+    )
+  );
+}
+
+// ── EYE ICONS ────────────────────────────────────────
+function EyeOpen(){
+  return React.createElement("svg",{width:18,height:18,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2,strokeLinecap:"round",strokeLinejoin:"round"},
+    React.createElement("path",{d:"M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"}),
+    React.createElement("circle",{cx:12,cy:12,r:3})
+  );
+}
+function EyeClosed(){
+  return React.createElement("svg",{width:18,height:18,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2,strokeLinecap:"round",strokeLinejoin:"round"},
+    React.createElement("path",{d:"M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19"}),
+    React.createElement("line",{x1:1,y1:1,x2:23,y2:23})
+  );
+}
+
+// ══════════════════════════════════════════
+// LOGIN
+// ══════════════════════════════════════════
+function Login({onLogin}){
+  const[mode,setMode]=useState("login");
+  const[email,setEmail]=useState("");
+  const[pass,setPass]=useState("");
+  const[name,setName]=useState("");
+  const[showPw,setShowPw]=useState(false);
+  const[err,setErr]=useState("");
+  const[loading,setLoading]=useState(false);
+
+  async function submit(){
+    setErr("");
+    if(!email||!pass){setErr("Please fill in all fields.");return;}
+    if(mode==="signup"&&!name){setErr("Please enter your name.");return;}
+    if(pass.length<6){setErr("Password must be at least 6 characters.");return;}
+    setLoading(true);
+    await new Promise(function(r){setTimeout(r,900);});
+    if(mode==="signup"){
+      const ud={name:name||email.split("@")[0],email:email};
+      notifyEmail(ud);
+      notifyWhatsApp(ud);
+    }
+    setLoading(false);
+    onLogin(name||email.split("@")[0]);
+  }
+
+  const iStyle={width:"100%",padding:"13px 16px",background:T.s2,border:"1px solid rgba(255,255,255,.1)",borderRadius:8,color:T.t0,fontSize:14,fontFamily:T.sans,outline:"none",transition:"border-color .2s"};
+  function fo(e){e.target.style.borderColor=T.ac;e.target.style.boxShadow="0 0 0 3px rgba(0,212,255,.08)";}
+  function bl(e){e.target.style.borderColor="rgba(255,255,255,.1)";e.target.style.boxShadow="none";}
+
+  return(
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",padding:24,background:T.bg,position:"relative"}}>
+      <div style={{position:"fixed",inset:0,background:"radial-gradient(ellipse at 50% 0%,rgba(0,212,255,.12),transparent 60%)",pointerEvents:"none"}}/>
+      <div style={{position:"fixed",inset:0,backgroundImage:"linear-gradient(rgba(255,255,255,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(0,212,255,.03) 1px,transparent 1px)",backgroundSize:"56px 56px",pointerEvents:"none"}}/>
+      <div style={{position:"relative",zIndex:1,width:"100%",maxWidth:430}}>
+        <div style={{textAlign:"center",marginBottom:36}}>
+          <div style={{display:"inline-flex",alignItems:"center",justifyContent:"center",width:54,height:54,borderRadius:13,marginBottom:14,background:"linear-gradient(135deg,"+T.ac+","+T.bl+")",fontSize:24,fontWeight:900,color:"#000",fontFamily:T.disp,boxShadow:"0 0 40px rgba(0,212,255,.4)"}}>⌖</div>
+          <h1 style={{fontFamily:T.disp,fontSize:26,fontWeight:900,letterSpacing:"-.03em",color:T.t0,marginBottom:5}}>Code<span style={{color:T.ac}}>Probe</span></h1>
+          <p style={{fontSize:13,color:T.t1}}>Enterprise Code Intelligence Platform</p>
+        </div>
+        <div style={{background:T.s1,border:"1px solid rgba(255,255,255,.09)",borderRadius:16,padding:34,boxShadow:"0 32px 80px rgba(0,0,0,.5)"}}>
+          <div style={{display:"flex",background:T.s2,borderRadius:8,padding:3,marginBottom:26}}>
+            {[["login","Sign In"],["signup","Sign Up"]].map(function([m,l]){return(
+              <button key={m} onClick={function(){setMode(m);setErr("");}} style={{flex:1,padding:"9px",borderRadius:6,border:"none",cursor:"pointer",fontSize:13,fontWeight:mode===m?700:400,fontFamily:T.sans,transition:"all .2s",background:mode===m?T.s1:"transparent",color:mode===m?T.t0:T.t1,boxShadow:mode===m?"0 2px 8px rgba(0,0,0,.3)":"none"}}>{l}</button>
+            );})}
+          </div>
+          {err&&<div style={{background:"rgba(255,64,96,.1)",border:"1px solid rgba(255,64,96,.25)",borderRadius:7,padding:"10px 14px",marginBottom:16,fontSize:13,color:T.rd}}>⚠ {err}</div>}
+          {mode==="signup"&&(
+            <div style={{marginBottom:14}}>
+              <label style={{fontSize:10,fontFamily:T.mono,color:T.t2,display:"block",marginBottom:6,letterSpacing:".1em",textTransform:"uppercase"}}>Full Name</label>
+              <input value={name} onChange={function(e){setName(e.target.value);}} placeholder="Jane Doe" style={iStyle} onFocus={fo} onBlur={bl}/>
+            </div>
+          )}
+          <div style={{marginBottom:14}}>
+            <label style={{fontSize:10,fontFamily:T.mono,color:T.t2,display:"block",marginBottom:6,letterSpacing:".1em",textTransform:"uppercase"}}>Email Address</label>
+            <input type="email" value={email} onChange={function(e){setEmail(e.target.value);}} placeholder="you@company.com" style={iStyle} onFocus={fo} onBlur={bl} onKeyDown={function(e){if(e.key==="Enter")submit();}}/>
+          </div>
+          <div style={{marginBottom:22}}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+              <label style={{fontSize:10,fontFamily:T.mono,color:T.t2,letterSpacing:".1em",textTransform:"uppercase"}}>Password</label>
+              {mode==="login"&&<button style={{fontSize:11,fontFamily:T.mono,color:T.ac,background:"none",border:"none",cursor:"pointer"}}>Forgot password?</button>}
+            </div>
+            <div style={{position:"relative"}}>
+              <input type={showPw?"text":"password"} value={pass} onChange={function(e){setPass(e.target.value);}} placeholder={showPw?"Your password":"••••••••"} style={{...iStyle,paddingRight:48}} onFocus={fo} onBlur={bl} onKeyDown={function(e){if(e.key==="Enter")submit();}}/>
+              <button onClick={function(){setShowPw(function(v){return !v;});}} style={{position:"absolute",right:13,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",cursor:"pointer",color:showPw?T.ac:T.t2,display:"flex",alignItems:"center",padding:4,borderRadius:4,transition:"color .2s"}} title={showPw?"Hide":"Show"}>
+                {showPw?<EyeOpen/>:<EyeClosed/>}
+              </button>
+            </div>
+            {mode==="signup"&&<p style={{fontSize:10,color:T.t2,fontFamily:T.mono,marginTop:5}}>Minimum 6 characters</p>}
+          </div>
+          <button onClick={submit} disabled={loading} style={{width:"100%",padding:14,borderRadius:8,border:"none",background:"linear-gradient(135deg,"+T.ac+","+T.bl+")",color:"#000",fontSize:14,fontWeight:800,fontFamily:T.sans,cursor:loading?"not-allowed":"pointer",letterSpacing:".04em",boxShadow:"0 0 28px rgba(0,212,255,.35)",opacity:loading?.7:1}}>
+            {loading?(mode==="signup"?"Creating account…":"Signing in…"):(mode==="login"?"Sign In →":"Create Account →")}
+          </button>
+          {mode==="signup"&&(
+            <div style={{marginTop:12,padding:"9px 13px",borderRadius:7,background:"rgba(0,229,160,.06)",border:"1px solid rgba(0,229,160,.15)",display:"flex",gap:8}}>
+              <span>🔔</span>
+              <p style={{fontSize:11,color:"rgba(0,229,160,.8)",fontFamily:T.mono,lineHeight:1.6}}>Daniel Mose will be notified via Email + WhatsApp.</p>
+            </div>
+          )}
+          <div style={{display:"flex",alignItems:"center",gap:12,margin:"18px 0"}}>
+            <div style={{flex:1,height:1,background:"rgba(255,255,255,.07)"}}/>
+            <span style={{fontSize:11,fontFamily:T.mono,color:T.t2}}>OR</span>
+            <div style={{flex:1,height:1,background:"rgba(255,255,255,.07)"}}/>
+          </div>
+          <button onClick={function(){setEmail("demo@codeprobe.ai");setPass("Demo1234");setTimeout(submit,80);}} style={{width:"100%",padding:12,borderRadius:8,border:"1px solid rgba(255,255,255,.1)",background:"transparent",color:T.t1,fontSize:13,fontFamily:T.sans,cursor:"pointer"}}>
+            ⚡ Continue with Demo Account
+          </button>
+        </div>
+        <p style={{textAlign:"center",fontSize:11,fontFamily:T.mono,color:T.t2,marginTop:18}}>Built by <span style={{color:T.ac}}>Daniel Mose</span></p>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════
+// ANALYZER — REAL GitHub + Gemini
+// ══════════════════════════════════════════
+function Analyzer(){
+  const[repo,setRepo]=useState("");
+  const[ghToken,setGhToken]=useState("");
+  const[showToken,setShowToken]=useState(false);
+  const[phase,setPhase]=useState("idle"); // idle|fetching|analyzing|done|error
+  const[status,setStatus]=useState("");
+  const[issues,setIssues]=useState([]);
+  const[sel,setSel]=useState(null);
+  const[aiCache,setAiCache]=useState({});
+  const[aiLoad,setAiLoad]=useState(false);
+  const[aiText,setAiText]=useState("");
+  const[tab,setTab]=useState("detail");
+  const[errMsg,setErrMsg]=useState("");
+  const[repoFiles,setRepoFiles]=useState([]);
+
+  const SEV={critical:{c:T.rd,bg:"rgba(255,64,96,.1)",l:"CRITICAL"},warning:{c:T.am,bg:"rgba(255,176,32,.1)",l:"WARNING"},info:{c:T.bl,bg:"rgba(77,159,255,.1)",l:"INFO"}};
+
+  async function runScan(){
+    const parts=repo.trim().replace("https://github.com/","").split("/");
+    if(parts.length<2||!parts[0]||!parts[1]){setErrMsg("Enter a valid repo like: facebook/react");return;}
+    const owner=parts[0], name=parts[1];
+    GH_TOKEN=ghToken.trim();
+    setPhase("fetching");setErrMsg("");setIssues([]);setSel(null);setAiText("");setRepoFiles([]);
+
+    try{
+      setStatus("Fetching files from "+owner+"/"+name+"…");
+      const files = await fetchRepoFiles(owner, name);
+      setRepoFiles(files);
+      setStatus("Analyzing "+files.length+" files with Gemini AI…");
+      setPhase("analyzing");
+
+      const raw = await analyzeCode(files, owner+"/"+name);
+      const parsed = parseIssues(raw, files);
+
+      if(parsed.length===0){
+        setErrMsg("Gemini found no significant issues in this repository, or could not parse the response. Try another repo.");
+        setPhase("idle");
+        return;
+      }
+
+      setIssues(parsed);
+      setPhase("done");
+    }catch(e){
+      setErrMsg(e.message||"Something went wrong. Check your internet connection.");
+      setPhase("idle");
+    }
+  }
+
+  async function pickIssue(issue){
+    setSel(issue);setTab("detail");
+    if(aiCache[issue.id]){setAiText(aiCache[issue.id]);return;}
+    setAiLoad(true);setAiText("");
+    try{
+      const t = await gemini("Analyze this real code issue from a GitHub repo.\nTitle: "+issue.title+"\nFile: "+issue.file+"\nProblem: "+issue.desc+"\nVulnerable code:\n"+issue.bad+"\n\nIn 3 sentences: (1) exact attack/impact, (2) why the fix works, (3) one extra hardening step.");
+      setAiCache(function(c){const n={...c};n[issue.id]=t;return n;});
+      setAiText(t);
+    }catch(e){setAiText("AI analysis failed: "+e.message);}
+    setAiLoad(false);
+  }
+
+  const critCount=issues.filter(function(i){return i.sev==="critical";}).length;
+  const warnCount=issues.filter(function(i){return i.sev==="warning";}).length;
+  const infoCount=issues.filter(function(i){return i.sev==="info";}).length;
+  const score=Math.max(10, 100-critCount*25-warnCount*10-infoCount*3);
+
+  return(
+    <div style={{paddingTop:64,minHeight:"100vh"}}>
+      <div style={{maxWidth:1100,margin:"0 auto",padding:"64px 36px 40px"}}>
+        <div style={{display:"inline-flex",alignItems:"center",gap:8,background:"rgba(0,212,255,.07)",border:"1px solid rgba(0,212,255,.25)",padding:"5px 14px",borderRadius:4,marginBottom:24}}>
+          <Dot size={6}/><span style={{fontSize:10,fontFamily:T.mono,color:T.ac,letterSpacing:".12em"}}>REAL GITHUB ANALYSIS · GEMINI AI</span>
+        </div>
+        <h1 style={{fontFamily:T.disp,fontSize:"clamp(2rem,5vw,4rem)",fontWeight:900,lineHeight:1.05,letterSpacing:"-.04em",color:T.t0,marginBottom:16,maxWidth:640}}>
+          Analyze Any<br/><span style={{background:"linear-gradient(90deg,"+T.ac+","+T.bl+")",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",backgroundClip:"text"}}>Real GitHub Repo</span>
+        </h1>
+        <p style={{fontSize:14,color:T.t1,lineHeight:1.85,maxWidth:500,marginBottom:32,fontWeight:300}}>
+          Paste any public GitHub repository URL. Gemini AI will fetch the actual source files and find real security and performance issues.
+        </p>
+
+        <div style={{display:"flex",gap:10,maxWidth:640,marginBottom:10}}>
+          <input value={repo} onChange={function(e){setRepo(e.target.value);setErrMsg("");}}
+            onKeyDown={function(e){if(e.key==="Enter")runScan();}}
+            placeholder="e.g. facebook/react or https://github.com/django/django"
+            style={{flex:1,padding:"14px 16px",background:T.s2,border:"1px solid rgba(255,255,255,.1)",borderRadius:8,color:T.t0,fontSize:13,fontFamily:T.mono,outline:"none",transition:"border-color .2s"}}
+            onFocus={function(e){e.target.style.borderColor=T.ac;}} onBlur={function(e){e.target.style.borderColor="rgba(255,255,255,.1)";}}/>
+          <button onClick={runScan} disabled={phase==="fetching"||phase==="analyzing"}
+            style={{padding:"14px 28px",borderRadius:8,border:"none",fontWeight:800,fontSize:13,fontFamily:T.sans,letterSpacing:".04em",whiteSpace:"nowrap",transition:"all .3s",cursor:(phase==="fetching"||phase==="analyzing")?"not-allowed":"pointer",background:(phase==="fetching"||phase==="analyzing")?T.s2:"linear-gradient(135deg,"+T.ac+","+T.bl+")",color:(phase==="fetching"||phase==="analyzing")?T.t2:"#000",boxShadow:(phase==="fetching"||phase==="analyzing")?"none":"0 0 28px rgba(0,212,255,.4)"}}>
+            {phase==="fetching"?"Fetching…":phase==="analyzing"?"Analyzing…":"Analyze →"}
+          </button>
+        </div>
+
+        <div style={{display:"flex",gap:8,marginBottom:16}}>
+          {["vercel/next.js","expressjs/express","django/django","tiangolo/fastapi"].map(function(r){return(
+            <button key={r} onClick={function(){setRepo(r);}} style={{padding:"4px 11px",borderRadius:4,border:"1px solid rgba(255,255,255,.08)",background:"transparent",color:T.t2,fontSize:10,fontFamily:T.mono,cursor:"pointer"}}>{r}</button>
+          );})}
+        </div>
+
+        <div style={{maxWidth:640,marginBottom:8}}>
+          <label style={{fontSize:10,fontFamily:T.mono,color:T.t2,display:"block",marginBottom:6,letterSpacing:".1em",textTransform:"uppercase"}}>
+            GitHub Token <span style={{color:T.t2,fontWeight:400,textTransform:"none",letterSpacing:0}}>(required — prevents rate limiting)</span>
+          </label>
+          <div style={{display:"flex",gap:10,alignItems:"center"}}>
+            <div style={{flex:1,position:"relative"}}>
+              <input type={showToken?"text":"password"} value={ghToken}
+                onChange={function(e){setGhToken(e.target.value);}}
+                placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+                style={{width:"100%",padding:"11px 44px 11px 14px",background:T.s2,border:"1px solid rgba(255,255,255,.1)",borderRadius:8,color:T.t0,fontSize:13,fontFamily:T.mono,outline:"none",transition:"border-color .2s"}}
+                onFocus={function(e){e.target.style.borderColor=T.ac;}} onBlur={function(e){e.target.style.borderColor="rgba(255,255,255,.1)"}}/>
+              <button onClick={function(){setShowToken(function(v){return !v;});}}
+                style={{position:"absolute",right:12,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",cursor:"pointer",color:showToken?T.ac:T.t2,display:"flex",alignItems:"center",padding:4,transition:"color .2s"}}
+                title={showToken?"Hide token":"Show token"}>
+                {showToken
+                  ? <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                  : <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+                }
+              </button>
+            </div>
+            <a href="https://github.com/settings/tokens/new?scopes=public_repo&description=CodeProbe" target="_blank" rel="noreferrer"
+              style={{padding:"11px 16px",borderRadius:8,border:"1px solid rgba(0,212,255,.3)",background:"rgba(0,212,255,.06)",color:T.ac,fontSize:11,fontFamily:T.mono,textDecoration:"none",whiteSpace:"nowrap",transition:"all .2s"}}
+              onMouseEnter={function(e){e.currentTarget.style.background="rgba(0,212,255,.12)";}} onMouseLeave={function(e){e.currentTarget.style.background="rgba(0,212,255,.06)";}}>
+              Get free token →
+            </a>
+          </div>
+          <p style={{fontSize:10,fontFamily:T.mono,color:T.t2,marginTop:6}}>
+            🔒 Your token is never stored or sent anywhere except GitHub's API. Needed to avoid rate limits.
+          </p>
+        </div>
+
+        {errMsg&&<div style={{marginTop:12,padding:"12px 16px",background:"rgba(255,64,96,.08)",border:"1px solid rgba(255,64,96,.25)",borderRadius:8,color:T.rd,fontSize:13}}>⚠ {errMsg}</div>}
+
+        {(phase==="fetching"||phase==="analyzing")&&(
+          <div style={{marginTop:24,maxWidth:560,background:T.s1,border:"1px solid rgba(255,255,255,.07)",borderRadius:11,padding:28}}>
+            <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16}}>
+              <div style={{width:20,height:20,border:"2px solid "+T.ac,borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.8s linear infinite"}}/>
+              <span style={{fontSize:13,fontFamily:T.mono,color:T.t1}}>{status}</span>
+            </div>
+            <div style={{height:3,background:T.bg,borderRadius:3}}>
+              <div style={{height:"100%",width:phase==="analyzing"?"70%":"35%",background:"linear-gradient(90deg,"+T.ac+","+T.bl+")",borderRadius:3,transition:"width 1s ease",boxShadow:"0 0 12px rgba(0,212,255,.5)"}}/>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {phase==="done"&&issues.length>0&&(
+        <div style={{maxWidth:1100,margin:"0 auto",padding:"0 36px 80px"}}>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14,marginBottom:22}}>
+            {[{v:score,s:"/ 100",l:"Health Score",c:score>70?T.gr:score>40?T.am:T.rd},{v:critCount,s:"issues",l:"Critical",c:T.rd},{v:warnCount,s:"issues",l:"Warnings",c:T.am},{v:infoCount,s:"issues",l:"Info",c:T.bl}].map(function({v,s,l,c}){return(
+              <div key={l} style={{background:T.s1,border:"1px solid rgba(255,255,255,.07)",borderRadius:9,padding:22,borderTop:"2px solid "+c}}>
+                <div style={{display:"flex",alignItems:"baseline",gap:5,marginBottom:3}}>
+                  <span style={{fontFamily:T.disp,fontSize:36,fontWeight:900,color:c,lineHeight:1}}>{v}</span>
+                  <span style={{fontSize:11,fontFamily:T.mono,color:T.t2}}>{s}</span>
+                </div>
+                <span style={{fontSize:9,fontFamily:T.mono,color:T.t1,textTransform:"uppercase",letterSpacing:".1em"}}>{l}</span>
+              </div>
+            );})}
+          </div>
+
+          <div style={{display:"grid",gridTemplateColumns:"280px 1fr",gap:18}}>
+            <div style={{background:T.s1,border:"1px solid rgba(255,255,255,.07)",borderRadius:9,overflow:"hidden"}}>
+              <div style={{padding:"12px 16px",borderBottom:"1px solid rgba(255,255,255,.06)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{fontSize:9,fontFamily:T.mono,color:T.t2,letterSpacing:".15em",textTransform:"uppercase"}}>Findings · {issues.length}</span>
+                <div style={{position:"relative",width:46,height:46}}>
+                  <svg width="46" height="46" style={{transform:"rotate(-90deg)"}}>
+                    <circle cx="23" cy="23" r="19" fill="none" stroke="rgba(255,255,255,.07)" strokeWidth="3"/>
+                    <circle cx="23" cy="23" r="19" fill="none" stroke={score>70?T.gr:score>40?T.am:T.rd} strokeWidth="3" strokeDasharray={(2*Math.PI*19*(score/100))+" "+(2*Math.PI*19)} strokeLinecap="round"/>
+                  </svg>
+                  <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center"}}>
+                    <span style={{fontFamily:T.disp,fontSize:11,fontWeight:900,color:score>70?T.gr:score>40?T.am:T.rd}}>{score}</span>
+                  </div>
+                </div>
+              </div>
+              <div style={{overflowY:"auto",maxHeight:500}}>
+                {issues.map(function(issue){
+                  const s=SEV[issue.sev];const active=sel&&sel.id===issue.id;
+                  return(
+                    <div key={issue.id} onClick={function(){pickIssue(issue);}}
+                      style={{padding:"12px 16px",borderBottom:"1px solid rgba(255,255,255,.04)",display:"flex",gap:9,cursor:"pointer",transition:"background .15s",background:active?"rgba(0,212,255,.07)":"transparent",borderLeft:active?"2px solid "+T.ac:"2px solid transparent"}}
+                      onMouseEnter={function(e){if(!active)e.currentTarget.style.background=T.s2;}} onMouseLeave={function(e){if(!active)e.currentTarget.style.background="transparent";}}>
+                      <div style={{width:6,height:6,borderRadius:"50%",background:s.c,marginTop:6,flexShrink:0,boxShadow:"0 0 6px "+s.c}}/>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:11,fontWeight:600,color:T.t0,marginBottom:4,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{issue.title}</div>
+                        <div style={{display:"flex",gap:5,alignItems:"center"}}>
+                          <Badge label={s.l} color={s.c} bg={s.bg}/>
+                          <span style={{fontSize:9,fontFamily:T.mono,color:T.t2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{issue.file.split("/").pop()}</span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div style={{background:T.s1,border:"1px solid rgba(255,255,255,.07)",borderRadius:9,overflow:"hidden",display:"flex",flexDirection:"column"}}>
+              <div style={{display:"flex",borderBottom:"1px solid rgba(255,255,255,.07)",padding:"0 3px"}}>
+                {[["detail","Issue Detail"],["files","Files Scanned"]].map(function([t,l]){return(
+                  <button key={t} onClick={function(){setTab(t);}} style={{padding:"12px 18px",border:"none",background:"none",fontFamily:T.mono,fontSize:9,fontWeight:tab===t?700:400,letterSpacing:".1em",textTransform:"uppercase",color:tab===t?T.ac:T.t2,borderBottom:tab===t?"2px solid "+T.ac:"2px solid transparent",cursor:"pointer"}}>{l}</button>
+                );})}
+              </div>
+              <div style={{flex:1,overflowY:"auto",maxHeight:540}}>
+                {tab==="detail"&&!sel&&(
+                  <div style={{padding:"70px 36px",textAlign:"center"}}>
+                    <div style={{fontSize:44,opacity:.1,marginBottom:14}}>⌖</div>
+                    <div style={{fontSize:10,fontFamily:T.mono,color:T.t2,letterSpacing:".1em",textTransform:"uppercase"}}>Select a finding to inspect</div>
+                  </div>
+                )}
+                {tab==="detail"&&sel&&(
+                  <div>
+                    <div style={{padding:"20px 24px",borderBottom:"1px solid rgba(255,255,255,.06)"}}>
+                      <div style={{display:"flex",gap:7,marginBottom:11}}>
+                        <Badge label={SEV[sel.sev].l} color={SEV[sel.sev].c} bg={SEV[sel.sev].bg}/>
+                        <Badge label={sel.cat} color={T.bl} bg="rgba(77,159,255,.1)"/>
+                      </div>
+                      <div style={{fontFamily:T.disp,fontSize:19,fontWeight:900,letterSpacing:"-.02em",color:T.t0,marginBottom:9}}>{sel.title}</div>
+                      <div style={{fontSize:13,color:T.t1,lineHeight:1.8,maxWidth:540}}>{sel.desc}</div>
+                      <div style={{marginTop:10,fontSize:10,fontFamily:T.mono,color:T.t2}}>{sel.file} · line {sel.line}</div>
+                    </div>
+                    <div style={{padding:"20px 24px"}}>
+                      <CodePane label="VULNERABLE CODE" code={sel.bad} color={T.rd}/>
+                      <CodePane label="RECOMMENDED FIX" code={sel.good} color={T.gr}/>
+                      <AITyping loading={aiLoad} text={aiText}/>
+                    </div>
+                  </div>
+                )}
+                {tab==="files"&&(
+                  <div style={{padding:24}}>
+                    <p style={{fontSize:11,fontFamily:T.mono,color:T.t2,marginBottom:16,textTransform:"uppercase",letterSpacing:".1em"}}>Files analyzed by Gemini</p>
+                    {repoFiles.map(function(f){return(
+                      <div key={f.path} style={{padding:"10px 14px",marginBottom:8,background:T.bg,border:"1px solid rgba(255,255,255,.06)",borderRadius:7,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                        <span style={{fontSize:12,fontFamily:T.mono,color:T.t1}}>{f.path}</span>
+                        <span style={{fontSize:10,fontFamily:T.mono,color:T.t2}}>{(f.content.length/1000).toFixed(1)}kb</span>
+                      </div>
+                    );})}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════
+// AI ASSISTANT
+// ══════════════════════════════════════════
+function AIAssistant(){
+  const[msgs,setMsgs]=useState([{r:"ai",t:"Hi! I'm CodeProbe AI by Daniel Mose.\n\nPaste any code for expert security and quality review. I'll find real vulnerabilities, explain the impact, and give you working fixes.\n\nWhat would you like analyzed?"}]);
+  const[inp,setInp]=useState("");
+  const[loading,setLoading]=useState(false);
+  const[hist,setHist]=useState([]);
+  const[starters,setStarters]=useState(true);
+  const bottom=useRef();const ta=useRef();
+  useEffect(function(){if(bottom.current)bottom.current.scrollIntoView({behavior:"smooth"});},[msgs]);
+
+  async function send(){
+    const q=inp.trim();if(!q||loading)return;
+    setInp("");if(ta.current)ta.current.style.height="auto";
+    setStarters(false);setMsgs(function(m){return [...m,{r:"user",t:q}];});setLoading(true);
+    const h=[...hist,{role:"user",parts:[{text:q}]}];
+    try{
+      const sys="You are CodeProbe AI by Daniel Mose. Review code for: security vulnerabilities (OWASP Top 10), performance issues, bugs, bad practices. Structure: (1) Issues found, (2) Why each matters, (3) Fixed code. Be specific and technical.";
+      const body={contents:[{role:"user",parts:[{text:"System: "+sys+"\nReady?"}]},{role:"model",parts:[{text:"Ready. Paste your code."}]},...h],generationConfig:{maxOutputTokens:600,temperature:0.3}};
+      const r=await fetch(GEMINI_URL,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+      const d=await r.json();
+      const ans=d&&d.candidates&&d.candidates[0]&&d.candidates[0].content&&d.candidates[0].content.parts&&d.candidates[0].content.parts[0]&&d.candidates[0].content.parts[0].text||"Analysis unavailable.";
+      setHist([...h,{role:"model",parts:[{text:ans}]}]);
+      setMsgs(function(m){return [...m,{r:"ai",t:ans}];});
+    }catch(e){setMsgs(function(m){return [...m,{r:"ai",t:"Connection error: "+e.message}];});}
+    setLoading(false);
+  }
+
+  const STARTS=["Review this Python function for SQL injection","Is this JWT auth implementation secure?","Find performance issues in this database query","What security issues does this API endpoint have?"];
+  return(
+    <div style={{paddingTop:64,minHeight:"100vh"}}>
+      <div style={{maxWidth:820,margin:"0 auto",padding:"44px 36px 80px"}}>
+        <div style={{textAlign:"center",marginBottom:28}}>
+          <div style={{display:"inline-flex",alignItems:"center",gap:8,background:"rgba(0,212,255,.07)",border:"1px solid rgba(0,212,255,.25)",padding:"5px 14px",borderRadius:4,marginBottom:18}}>
+            <Dot size={6}/><span style={{fontSize:10,fontFamily:T.mono,color:T.ac,letterSpacing:".12em"}}>GEMINI‑POWERED · REAL CODE REVIEW</span>
+          </div>
+          <h1 style={{fontFamily:T.disp,fontSize:"clamp(1.9rem,4vw,2.8rem)",fontWeight:900,letterSpacing:"-.03em",color:T.t0,marginBottom:10}}>AI Code Assistant</h1>
+          <p style={{color:T.t1,fontSize:14,lineHeight:1.8,maxWidth:420,margin:"0 auto"}}>Paste any code snippet and get real security, performance, and quality analysis from Gemini AI.</p>
+        </div>
+        {starters&&(
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:9,marginBottom:18}}>
+            {STARTS.map(function(s){return(
+              <button key={s} onClick={function(){setInp(s);setStarters(false);if(ta.current)ta.current.focus();}} style={{padding:"11px 14px",textAlign:"left",borderRadius:7,border:"1px solid rgba(255,255,255,.08)",background:T.s1,color:T.t1,fontSize:12,fontFamily:T.sans,cursor:"pointer",lineHeight:1.5,transition:"all .2s"}}
+                onMouseEnter={function(e){e.currentTarget.style.borderColor="rgba(0,212,255,.3)";e.currentTarget.style.color=T.t0;}} onMouseLeave={function(e){e.currentTarget.style.borderColor="rgba(255,255,255,.08)";e.currentTarget.style.color=T.t1;}}>{s} →</button>
+            );})}
+          </div>
+        )}
+        <div style={{background:T.s1,border:"1px solid rgba(255,255,255,.08)",borderRadius:11,overflow:"hidden",marginBottom:8}}>
+          <div style={{overflowY:"auto",padding:"20px 22px",display:"flex",flexDirection:"column",gap:13,maxHeight:400}}>
+            {msgs.map(function(m,i){return(
+              <div key={i} style={{display:"flex",justifyContent:m.r==="user"?"flex-end":"flex-start",gap:9}}>
+                {m.r==="ai"&&<div style={{width:30,height:30,borderRadius:"50%",flexShrink:0,marginTop:2,background:"linear-gradient(135deg,"+T.ac+","+T.bl+")",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:900,color:"#000",fontFamily:T.disp}}>⌖</div>}
+                <div style={{maxWidth:"78%",padding:"11px 15px",fontSize:13,lineHeight:1.8,whiteSpace:"pre-wrap",wordBreak:"break-word",fontFamily:T.sans,color:T.t0,borderRadius:m.r==="user"?"11px 11px 3px 11px":"3px 11px 11px 11px",background:m.r==="user"?"rgba(0,212,255,.1)":T.s2,border:"1px solid "+(m.r==="user"?"rgba(0,212,255,.2)":"rgba(255,255,255,.06)")}}>{m.t}</div>
+              </div>
+            );})}
+            {loading&&<div style={{display:"flex",gap:9}}>
+              <div style={{width:30,height:30,borderRadius:"50%",background:"linear-gradient(135deg,"+T.ac+","+T.bl+")",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,color:"#000"}}>⌖</div>
+              <div style={{padding:"11px 15px",background:T.s2,border:"1px solid rgba(255,255,255,.06)",borderRadius:"3px 11px 11px 11px",display:"flex",gap:5}}>
+                {[0,1,2].map(function(i){return <div key={i} style={{width:6,height:6,borderRadius:"50%",background:T.ac,animation:"bounce 1s "+(i*.15)+"s infinite"}}/>;})}</div>
+            </div>}
+            <div ref={bottom}/>
+          </div>
+          <div style={{borderTop:"1px solid rgba(255,255,255,.07)",padding:"13px 16px",background:"linear-gradient(0deg,"+T.bg+","+T.s1+")",display:"flex",gap:9,alignItems:"flex-end"}}>
+            <textarea ref={ta} value={inp} rows={1}
+              onChange={function(e){setInp(e.target.value);e.target.style.height="auto";e.target.style.height=Math.min(e.target.scrollHeight,160)+"px";}}
+              onKeyDown={function(e){if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}}}
+              placeholder="Paste code or ask a security question… (Enter sends, Shift+Enter for newline)"
+              style={{flex:1,padding:"10px 13px",background:T.bg,border:"1px solid rgba(255,255,255,.08)",borderRadius:7,color:T.t0,fontSize:12,fontFamily:T.mono,resize:"none",outline:"none",lineHeight:1.6,maxHeight:160}}
+              onFocus={function(e){e.target.style.borderColor=T.ac;}} onBlur={function(e){e.target.style.borderColor="rgba(255,255,255,.08)";}}/>
+            <button onClick={send} disabled={!inp.trim()||loading}
+              style={{width:42,height:42,borderRadius:7,border:"none",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",transition:"all .2s",background:(inp.trim()&&!loading)?"linear-gradient(135deg,"+T.ac+","+T.bl+")":T.s2,color:(inp.trim()&&!loading)?"#000":T.t2,cursor:(inp.trim()&&!loading)?"pointer":"not-allowed"}}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M2 21l21-9L2 3v7l15 2-15 2z"/></svg>
+            </button>
+          </div>
+        </div>
+        <p style={{textAlign:"center",fontSize:10,fontFamily:T.mono,color:T.t2}}>🔒 Powered by Gemini AI · Built by <span style={{color:T.ac}}>Daniel Mose</span></p>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════
+// CONTACT
+// ══════════════════════════════════════════
+function Contact(){
+  const[f,setF]=useState({name:"",email:"",subject:"",msg:""});
+  const[sent,setSent]=useState(false);
+  function submit(){
+    if(!f.name||!f.email||!f.msg){alert("Please fill in name, email and message.");return;}
+    const msg="Hi Daniel! Name: "+f.name+" | Email: "+f.email+" | Subject: "+(f.subject||"General")+"\n\n"+f.msg;
+    window.open("https://wa.me/254740851637?text="+encodeURIComponent(msg),"_blank");
+    setSent(true);setTimeout(function(){setSent(false);},5000);setF({name:"",email:"",subject:"",msg:""});
+  }
+  const box={background:T.s1,border:"1px solid rgba(255,255,255,.08)",borderRadius:11,overflow:"hidden"};
+  const head={padding:"14px 20px",borderBottom:"1px solid rgba(255,255,255,.07)",background:"linear-gradient(90deg,rgba(0,212,255,.06),transparent)"};
+  const inp={width:"100%",padding:"11px 14px",background:T.s2,border:"1px solid rgba(255,255,255,.08)",borderRadius:7,color:T.t0,fontSize:13,fontFamily:T.sans,outline:"none",boxSizing:"border-box"};
+  return(
+    <div style={{paddingTop:80,maxWidth:1060,margin:"0 auto",padding:"60px 36px 80px"}}>
+      <div style={{textAlign:"center",marginBottom:48}}>
+        <div style={{display:"inline-flex",alignItems:"center",gap:8,background:"rgba(0,212,255,.07)",border:"1px solid rgba(0,212,255,.25)",padding:"5px 14px",borderRadius:4,marginBottom:18}}>
+          <Dot size={6}/><span style={{fontSize:10,fontFamily:T.mono,color:T.ac,letterSpacing:".12em"}}>DANIEL MOSE · AVAILABLE FOR HIRE</span>
+        </div>
+        <h1 style={{fontFamily:T.disp,fontSize:"clamp(1.9rem,4vw,3rem)",fontWeight:900,letterSpacing:"-.03em",color:T.t0,marginBottom:12}}>Get In Touch</h1>
+        <p style={{color:T.t1,fontSize:14,maxWidth:440,margin:"0 auto",lineHeight:1.8}}>Software engineer & AI builder. Open to enterprise collaborations, freelance, and technical partnerships.</p>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1.5fr",gap:24,alignItems:"start"}}>
+        <div style={{display:"flex",flexDirection:"column",gap:18}}>
+          <div style={box}>
+            <div style={head}><span style={{fontSize:9,fontFamily:T.mono,color:T.ac,letterSpacing:".15em",textTransform:"uppercase"}}>Contact Channels</span></div>
+            {[{i:"✉",l:"Email",v:"danielmose776@gmail.com",h:"mailto:danielmose776@gmail.com"},{i:"💬",l:"WhatsApp",v:"+254 740 851 637",h:"https://wa.me/254740851637"},{i:"📞",l:"Phone",v:"0768 168 973",h:"tel:0768168973"}].map(function({i,l,v,h}){return(
+              <a key={l} href={h} target="_blank" rel="noreferrer" style={{display:"flex",alignItems:"center",gap:13,padding:"14px 20px",borderBottom:"1px solid rgba(255,255,255,.04)",textDecoration:"none",transition:"background .2s"}} onMouseEnter={function(e){e.currentTarget.style.background="rgba(0,212,255,.06)";}} onMouseLeave={function(e){e.currentTarget.style.background="transparent";}}>
+                <div style={{width:38,height:38,borderRadius:9,background:"rgba(0,212,255,.08)",border:"1px solid rgba(0,212,255,.2)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:17,flexShrink:0}}>{i}</div>
+                <div><div style={{fontSize:9,fontFamily:T.mono,color:T.t2,textTransform:"uppercase",letterSpacing:".1em",marginBottom:2}}>{l}</div><div style={{fontSize:12,fontWeight:600,color:T.t1}}>{v}</div></div>
+                <span style={{marginLeft:"auto",color:T.t2}}>→</span>
+              </a>
+            );})}
+          </div>
+          <div style={box}>
+            <div style={head}><span style={{fontSize:9,fontFamily:T.mono,color:T.ac,letterSpacing:".15em",textTransform:"uppercase"}}>Availability</span></div>
+            <div style={{padding:"6px 20px 10px"}}>
+              {[["Code Reviews","24–48 hrs",T.gr],["Freelance / Contract","Open",T.gr],["Enterprise Projects","By scope",T.ac],["Response Time","< 12 hrs",T.ac]].map(function([k,v,c]){return(
+                <div key={k} style={{display:"flex",justifyContent:"space-between",padding:"9px 0",borderBottom:"1px solid rgba(255,255,255,.04)"}}>
+                  <span style={{fontSize:12,color:T.t1}}>{k}</span><span style={{fontSize:9,fontFamily:T.mono,fontWeight:700,color:c}}>{v}</span>
+                </div>
+              );})}
+            </div>
+          </div>
+        </div>
+        <div style={box}>
+          <div style={head}><span style={{fontSize:9,fontFamily:T.mono,color:T.ac,letterSpacing:".15em",textTransform:"uppercase"}}>Send a Message</span></div>
+          <div style={{padding:24}}>
+            {sent&&<div style={{background:"rgba(0,229,160,.08)",border:"1px solid rgba(0,229,160,.25)",borderRadius:7,padding:"11px 15px",marginBottom:16,display:"flex",gap:9,alignItems:"center",fontSize:13,color:T.gr}}><Dot color={T.gr} size={6}/>Opening WhatsApp to contact Daniel!</div>}
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
+              <div><label style={{fontSize:9,fontFamily:T.mono,color:T.t2,display:"block",marginBottom:6,letterSpacing:".1em",textTransform:"uppercase"}}>Name *</label><input style={inp} value={f.name} onChange={function(e){setF({...f,name:e.target.value});}} placeholder="Jane Doe" onFocus={function(e){e.target.style.borderColor=T.ac;}} onBlur={function(e){e.target.style.borderColor="rgba(255,255,255,.08)";}}/></div>
+              <div><label style={{fontSize:9,fontFamily:T.mono,color:T.t2,display:"block",marginBottom:6,letterSpacing:".1em",textTransform:"uppercase"}}>Email *</label><input style={inp} type="email" value={f.email} onChange={function(e){setF({...f,email:e.target.value});}} placeholder="you@company.com" onFocus={function(e){e.target.style.borderColor=T.ac;}} onBlur={function(e){e.target.style.borderColor="rgba(255,255,255,.08)";}}/></div>
+            </div>
+            <div style={{marginBottom:12}}>
+              <label style={{fontSize:9,fontFamily:T.mono,color:T.t2,display:"block",marginBottom:6,letterSpacing:".1em",textTransform:"uppercase"}}>Subject</label>
+              <select style={{...inp,appearance:"none",cursor:"pointer"}} value={f.subject} onChange={function(e){setF({...f,subject:e.target.value});}} onFocus={function(e){e.target.style.borderColor=T.ac;}} onBlur={function(e){e.target.style.borderColor="rgba(255,255,255,.08)";}}>
+                <option value="">Select…</option><option>Freelance / Contract Work</option><option>Enterprise Partnership</option><option>Security Audit</option><option>General Inquiry</option><option>Job Opportunity</option>
+              </select>
+            </div>
+            <div style={{marginBottom:20}}>
+              <label style={{fontSize:9,fontFamily:T.mono,color:T.t2,display:"block",marginBottom:6,letterSpacing:".1em",textTransform:"uppercase"}}>Message *</label>
+              <textarea style={{...inp,minHeight:120,resize:"vertical",lineHeight:1.7}} value={f.msg} onChange={function(e){setF({...f,msg:e.target.value});}} placeholder="Describe your project or inquiry…" onFocus={function(e){e.target.style.borderColor=T.ac;}} onBlur={function(e){e.target.style.borderColor="rgba(255,255,255,.08)";}}/> 
+            </div>
+            <button onClick={submit} style={{width:"100%",padding:14,borderRadius:7,border:"none",background:"linear-gradient(135deg,"+T.ac+","+T.bl+")",color:"#000",fontSize:14,fontWeight:800,fontFamily:T.sans,cursor:"pointer",letterSpacing:".04em",boxShadow:"0 0 28px rgba(0,212,255,.35)"}}>Send via WhatsApp →</button>
+            <p style={{textAlign:"center",fontSize:10,fontFamily:T.mono,color:T.t2,marginTop:10}}>Or: <span style={{color:T.ac,cursor:"pointer",textDecoration:"underline"}} onClick={function(){window.location="mailto:"+"danielmose776@gmail.com";}}>danielmose776&#64;gmail.com</span></p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════
+// ROOT APP
+// ══════════════════════════════════════════
+function App(){
+  const[user,setUser]=useState(null);
+  const[page,setPage]=useState("analyzer");
+
+  const nl=function(p){return{padding:"6px 16px",borderRadius:5,border:"none",background:page===p?"rgba(0,212,255,.08)":"transparent",color:page===p?T.ac:T.t1,fontSize:13,fontWeight:page===p?700:400,fontFamily:T.sans,cursor:"pointer",transition:"all .2s",borderBottom:page===p?"2px solid "+T.ac:"2px solid transparent"};};
+
+  if(!user) return <Login onLogin={function(n){setUser(n);}}/>;
+
+  return(
+    <div style={{minHeight:"100vh",background:T.bg,color:T.t0,fontFamily:T.sans,overflowX:"hidden",position:"relative"}}>
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+      <div style={{position:"fixed",inset:0,pointerEvents:"none",zIndex:0,backgroundImage:"linear-gradient(rgba(255,255,255,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.03) 1px,transparent 1px)",backgroundSize:"56px 56px"}}/>
+      <div style={{position:"fixed",top:"-180px",left:"50%",transform:"translateX(-50%)",width:"900px",height:"500px",pointerEvents:"none",zIndex:0,background:"radial-gradient(ellipse,rgba(0,212,255,.1) 0%,transparent 65%)"}}/>
+      <nav style={{position:"fixed",top:0,left:0,right:0,zIndex:100,height:64,display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0 36px",background:"rgba(0,5,15,.92)",backdropFilter:"blur(20px)",borderBottom:"1px solid rgba(255,255,255,.08)"}}>
+        <div onClick={function(){setPage("analyzer");}} style={{display:"flex",alignItems:"center",gap:9,cursor:"pointer"}}>
+          <div style={{width:32,height:32,borderRadius:7,background:"linear-gradient(135deg,"+T.ac+","+T.bl+")",display:"flex",alignItems:"center",justifyContent:"center",fontSize:17,fontWeight:900,color:"#000",fontFamily:T.disp}}>⌖</div>
+          <span style={{fontFamily:T.disp,fontSize:17,fontWeight:900,letterSpacing:"-.03em",color:T.t0}}>Code<span style={{color:T.ac}}>Probe</span></span>
+        </div>
+        <div style={{display:"flex",gap:3}}>
+          {[["analyzer","Analyzer"],["ai","AI Assistant"],["contact","Contact"]].map(function([p,l]){return <button key={p} style={nl(p)} onClick={function(){setPage(p);}}>{l}</button>;})}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <div style={{display:"flex",alignItems:"center",gap:7,fontSize:11,fontFamily:T.mono,color:T.t1}}><Dot size={6}/>LIVE</div>
+          <div style={{display:"flex",alignItems:"center",gap:8,padding:"5px 12px",borderRadius:6,background:T.s1,border:"1px solid rgba(255,255,255,.08)"}}>
+            <div style={{width:26,height:26,borderRadius:"50%",background:"linear-gradient(135deg,"+T.ac+","+T.bl+")",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:900,color:"#000"}}>{user[0].toUpperCase()}</div>
+            <span style={{fontSize:12,color:T.t1,fontFamily:T.sans}}>{user}</span>
+            <button onClick={function(){setUser(null);}} style={{fontSize:10,fontFamily:T.mono,color:T.t2,background:"none",border:"none",cursor:"pointer",marginLeft:4}} onMouseEnter={function(e){e.target.style.color=T.rd;}} onMouseLeave={function(e){e.target.style.color=T.t2;}}>sign out</button>
+          </div>
+        </div>
+      </nav>
+      <div style={{position:"relative",zIndex:1}}>
+        {page==="analyzer"&&<Analyzer/>}
+        {page==="ai"&&<AIAssistant/>}
+        {page==="contact"&&<Contact/>}
+      </div>
+      <footer style={{position:"relative",zIndex:1,borderTop:"1px solid rgba(255,255,255,.07)",padding:"22px 36px",display:"flex",justifyContent:"space-between",alignItems:"center",background:"rgba(3,12,26,.8)"}}>
+        <span style={{fontFamily:T.disp,fontWeight:900,fontSize:14,color:T.t0}}>Code<span style={{color:T.ac}}>Probe</span><span style={{fontSize:10,fontFamily:T.mono,color:T.t2,fontWeight:400}}> · Daniel Mose</span></span>
+        <div style={{display:"flex",gap:18}}>{[["analyzer","Analyzer"],["ai","AI Assistant"],["contact","Contact"]].map(function([p,l]){return <button key={p} onClick={function(){setPage(p);}} style={{background:"none",border:"none",fontSize:12,color:T.t2,cursor:"pointer",fontFamily:T.sans}}>{l}</button>;})}</div>
+        <div style={{display:"flex",gap:16}}>
+          {[{t:"danielmose776@gmail.com",h:"mailto:danielmose776@gmail.com"},{t:"WhatsApp",h:"https://wa.me/254740851637"},{t:"0768 168 973",h:"tel:0768168973"}].map(function({t,h}){return <a key={t} href={h} target="_blank" rel="noreferrer" style={{fontSize:10,fontFamily:T.mono,color:T.t2,textDecoration:"none",cursor:"pointer"}} onMouseEnter={function(e){e.target.style.color=T.ac;}} onMouseLeave={function(e){e.target.style.color=T.t2;}} onClick={function(){if(h==="#email")window.location="mailto:"+"danielmose776@gmail.com";else window.open(h,"_blank");}}>{t}</a>;})}
+        </div>
+      </footer>
+    </div>
+  );
+}
+
+// Restore any CF-obfuscated emails on page load
+window.addEventListener('load', function(){
+  document.querySelectorAll('.__cf_email__').forEach(function(el){
+    var encoded = el.getAttribute('data-cfemail');
+    if(encoded){
+      var email = '', r = parseInt(encoded.substr(0,2),16);
+      for(var n=2; n<encoded.length; n+=2){
+        email += String.fromCharCode(parseInt(encoded.substr(n,2),16)^r);
+      }
+      el.textContent = email;
+      el.removeAttribute('data-cfemail');
+    }
+  });
+});
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+</script>
+</body>
+</html>
